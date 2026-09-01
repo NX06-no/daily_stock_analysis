@@ -3327,7 +3327,10 @@ class GeminiAnalyzer:
             or 8192
         )
         requested_temperature = generation_config.get('temperature', 0.7)
-        requested_timeout = generation_config.get("timeout")
+        # 未显式指定 timeout 时给一个宽松默认值（300s）：推理模型在长 prompt 下
+        # 思考+输出可能超过 litellm provider 默认超时，连接被断开导致空响应/截断，
+        # 最终表现为 LLM returned empty response。
+        requested_timeout = generation_config.get("timeout") or 300
 
         models_to_try = [config.litellm_model] + (config.litellm_fallback_models or [])
         models_to_try = [m for m in models_to_try if m]

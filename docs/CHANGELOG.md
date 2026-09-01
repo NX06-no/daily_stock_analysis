@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] 将 litellm 依赖窗口上界收敛到 `<1.99.0`：1.99.0 起把 `prompt_cache_key` 透传给 OpenAI provider，破坏 provider 缓存测试对不透传行为的既有断言（CI backend-tests 3/3 与 backend-gate 失败）；保留历史最低版本与 `!=1.82.7`/`!=1.82.8` 事故排除，同时同步更新各 LLM 兼容文档中写死的依赖约束表述，避免文档与 requirements.txt 漂移
 
 - [新功能] 新增 `SEARXNG_TIMEOUT_SECONDS` 配置自建 SearXNG 单次搜索超时（默认 10 秒），已接线全部 SearchService 构造入口（含题材搜索子进程重建）与默认 GitHub Actions 工作流
+- [新功能] 筹码分布新增本地估算降级：东方财富 `push2his` 端点不可达（RemoteDisconnected/限流）导致 `ak.stock_cyq_em` 失败时，自动改用 Baostock 日K（含换手率）+ 本地 CYQ 三角分布算法复算获利比例/平均成本/90 与 70 成本区间和集中度，保证筹码数据可用；东财接口恢复后仍优先走原路径，算法与东财 CYQCalculator 一致并附单元回归测试。
+- [改进] LLM 调用未显式配置超时时默认放宽到 300 秒：推理模型在长 prompt 下思考+输出可能超过 LiteLLM provider 默认连接超时，导致空响应或输出截断；现有显式配置（`timeout`/`call_timeout`）仍优先。
 
 - [修复] 美股日线路由现按各数据源当前优先级排序，单项 `*_PRIORITY` 配置（如 `YFINANCE_PRIORITY=0`）对美股即时生效；指数固定首选与 Longbridge preferred 语义保持不变
 
@@ -55,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [改进] 任务列表/SSE 事件、历史列表项与 stock-bar 项追加可选 `asset_type`（`stock`/`index`）：任务侧从已提交的 `analysis_target` 透传（不重新猜测），历史与 stock-bar 侧由持久化 `record.code` 经 `parse_analysis_target` 生成；旧客户端与 market review 可缺省，字段可选追加不破坏既有契约。
 - [修复] Web 首页与自选工作区改用资产感知身份键：任务/报告/历史的 `assetType` 优先，且被后端保证为 parser canonical 的代码只做**大小写折叠**（`SH000016`→`sh000016`），禁止再用前缀/后缀正则猜 canonical（否则 `000300.CSI` 会被误猜成 `csi000300`、`sz399300` 被误当成独立 canonical，违反注册表唯一判型真源）；仅 watchlist 原始字符串缺少类型时，才用已加载 `stocks.index.json` 的 `assetType=index` 行 canonical/display/显式 alias 精确命中（不先 normalize、不用前缀正则猜测；加载期间禁用批量分析，加载失败或请求超过 10 秒时按既有股票语义 fail-open）；行选中、active task 与完成自动选中按资产类型分桶，`sh000016` 指数行与 `000016` 股票行状态独立，完成后自动选中正确 canonical 指数报告。
 - [修复] Chat 消息恢复、发送与报告追问对显式 SH/SZ/CSI 已登记指数统一按注册表 canonical 判型并覆盖默认 LiteLLM 与 Codex：所有 Chat 后端首帧加载 registry，加载期间延迟 URL/历史恢复并禁用发送，settle 后 `sh000016`/`sz399001`/`000016.SH`/`930955.CSI`/`csi930955` 只产出一个 lowercase canonical；后端 `resolve_stock_scope`、工具守卫与 cache key 复用 parser `INDEX` 身份，保持指数与裸同码股票隔离；未登记、空 registry 或加载失败时维持既有股票 fail-open，绝不按前缀猜指数。
+- [改进] 自建 SearXNG 的 baidu/sogou/bing 结果普遍缺失 publishedDate，严格时效过滤会把可用新闻全部丢弃导致新闻面为空；对 SearXNG 路径（个股新闻、多维度情报搜索、题材搜索）放行无日期结果（仍受引擎 time_range 约束），其余 provider 时效语义保持不变。
 
 ## [3.31.0] - 2026-08-23
 
