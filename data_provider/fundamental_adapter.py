@@ -367,6 +367,44 @@ class AkshareFundamentalAdapter:
                 return df, f"{api_name}(period)", errors
         return None, None, errors
 
+    @staticmethod
+    def _fill_growth_from_row(row) -> Dict[str, Any]:
+        """从单行提取 growth/financial_report 载荷；effective 表示是否提取到有效指标。"""
+        revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业总收入-同比增长", "营业收入同比", "营收同比", "收入同比", "同比增长"]))
+        profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润-同比增长", "净利润同比", "净利同比", "归母净利润同比"]))
+        roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
+        gross_margin = _safe_float(_pick_by_keywords(row, ["销售毛利率", "毛利率"]))
+        report_date = _normalize_report_date(
+            _pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"])
+            or _pick_by_keywords(row, ["最新公告日期", "公告日期", "报告期"])
+        )
+        revenue = _safe_float(_pick_by_keywords(row, ["营业总收入-营业总收入", "营业总收入", "营业收入", "营收"]))
+        net_profit_parent = _safe_float(_pick_by_keywords(row, ["净利润-净利润", "归母净利润", "母公司股东净利润", "净利润"]))
+        operating_cash_flow = _safe_float(
+            _pick_by_keywords(row, ["经营活动产生的现金流量净额", "每股经营现金流量", "经营现金流", "经营活动现金流"])
+        )
+        growth = {
+            "revenue_yoy": revenue_yoy,
+            "net_profit_yoy": profit_yoy,
+            "roe": roe,
+            "gross_margin": gross_margin,
+        }
+        financial_report = {
+            "report_date": report_date,
+            "revenue": revenue,
+            "net_profit_parent": net_profit_parent,
+            "operating_cash_flow": operating_cash_flow,
+            "roe": roe,
+        }
+        effective = any(v is not None for v in growth.values()) or any(
+            v is not None for v in financial_report.values()
+        )
+        return {
+            "growth": growth,
+            "financial_report": financial_report if any(v is not None for v in financial_report.values()) else None,
+            "effective": effective,
+        }
+
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
@@ -381,58 +419,52 @@ class AkshareFundamentalAdapter:
         }
 
         # Financial indicators
-        # 优先用业绩报表 stock_yjbb_em(报告期)：列名规整（营业总收入-同比增长/净资产收益率/销售毛利率
-        # 等），按代码过滤即可取到单股最新一期口径；失败再回退 stock_financial_abstract 通用候选。
-        yjbb_df, yjbb_source, yjbb_errors = self._earnings_em_by_api(stock_code, ("stock_yjbb_em",))
-        if yjbb_df is not None and not yjbb_df.empty:
-            fin_df, fin_source, fin_errors = yjbb_df, yjbb_source, []
-        else:
-            fin_errors = yjbb_errors
-            fin_df, fin_source, _ = None, None, []
-            fallback_df, fallback_source, fallback_errors = self._call_df_candidates([
-                ("stock_financial_abstract", {"symbol": stock_code}),
-                ("stock_financial_analysis_indicator", {"symbol": stock_code}),
-                ("stock_financial_analysis_indicator", {}),
-            ])
-            fin_errors.extend(fallback_errors)
-            if fallback_df is not None:
-                fin_df, fin_source = fallback_df, fallback_source
+        # 通用候选链（保持调用时序与既有测试契约）。新版 stock_financial_abstract 为
+        # 透视表格式（指标×报告期），旧行级解析可能取不到有效指标，此时用业绩报表兜底。
+        fin_df, fin_source, fin_errors = self._call_df_candidates([
+            ("stock_financial_abstract", {"symbol": stock_code}),
+            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
+            ("stock_financial_analysis_indicator", {}),
+        ])
         result["errors"].extend(fin_errors)
+        growth_ok = False
         if fin_df is not None:
             row = _extract_latest_row(fin_df, stock_code)
             if row is not None:
-                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业总收入-同比增长", "营业收入同比", "营收同比", "收入同比", "同比增长"]))
-                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润-同比增长", "净利润同比", "净利同比", "归母净利润同比"]))
-                roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
-                gross_margin = _safe_float(_pick_by_keywords(row, ["销售毛利率", "毛利率"]))
-                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]) or _pick_by_keywords(row, ["最新公告日期", "公告日期", "报告期"]))
-                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入-营业总收入", "营业总收入", "营业收入", "营收"]))
-                net_profit_parent = _safe_float(_pick_by_keywords(row, ["净利润-净利润", "归母净利润", "母公司股东净利润", "净利润"]))
-                operating_cash_flow = _safe_float(
-                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "每股经营现金流量", "经营现金流", "经营活动现金流"])
-                )
-                result["growth"] = {
-                    "revenue_yoy": revenue_yoy,
-                    "net_profit_yoy": profit_yoy,
-                    "roe": roe,
-                    "gross_margin": gross_margin,
-                }
-                financial_report_payload = {
-                    "report_date": report_date,
-                    "revenue": revenue,
-                    "net_profit_parent": net_profit_parent,
-                    "operating_cash_flow": operating_cash_flow,
-                    "roe": roe,
-                }
-                if any(v is not None for v in financial_report_payload.values()):
-                    result["earnings"]["financial_report"] = financial_report_payload
-                result["source_chain"].append(f"growth:{fin_source}")
+                payload = self._fill_growth_from_row(row)
+                if payload["effective"]:
+                    result["growth"].update(payload["growth"])
+                    if payload["financial_report"] is not None:
+                        result["earnings"]["financial_report"] = payload["financial_report"]
+                    result["source_chain"].append(f"growth:{fin_source}")
+                    growth_ok = True
+        if not growth_ok:
+            # 业绩报表 stock_yjbb_em(报告期) 按代码过滤兜底：列规整，恢复 growth/financial_report
+            yjbb_df, yjbb_source, yjbb_errors = self._earnings_em_by_api(stock_code, ("stock_yjbb_em",))
+            result["errors"].extend(yjbb_errors)
+            if yjbb_df is not None:
+                row = _extract_latest_row(yjbb_df, stock_code)
+                if row is not None:
+                    payload = self._fill_growth_from_row(row)
+                    if payload["effective"]:
+                        result["growth"].update(payload["growth"])
+                        if payload["financial_report"] is not None:
+                            result["earnings"]["financial_report"] = payload["financial_report"]
+                        result["source_chain"].append(f"growth:{yjbb_source}")
 
-        # Earnings forecast（akshare 新版业绩预告接口只接受报告期 date，按期拉取后过滤单股）
-        forecast_df, forecast_source, forecast_errors = self._earnings_em_by_api(
-            stock_code, ("stock_yjyg_em", "stock_yjbb_em")
-        )
+        # Earnings forecast（候选链失败后，用报告期全市场 + 按代码过滤兜底适配新接口签名）
+        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
+            ("stock_yjyg_em", {"symbol": stock_code}),
+            ("stock_yjyg_em", {}),
+            ("stock_yjbb_em", {"symbol": stock_code}),
+            ("stock_yjbb_em", {}),
+        ])
         result["errors"].extend(forecast_errors)
+        if forecast_df is None or forecast_df.empty:
+            forecast_df, forecast_source, period_errors = self._earnings_em_by_api(
+                stock_code, ("stock_yjyg_em", "stock_yjbb_em")
+            )
+            result["errors"].extend(period_errors)
         if forecast_df is not None:
             row = _extract_latest_row(forecast_df, stock_code)
             if row is not None:
@@ -442,10 +474,16 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
         # Earnings quick report
-        quick_df, quick_source, quick_errors = self._earnings_em_by_api(
-            stock_code, ("stock_yjkb_em", "stock_yjbb_em")
-        )
+        quick_df, quick_source, quick_errors = self._call_df_candidates([
+            ("stock_yjkb_em", {"symbol": stock_code}),
+            ("stock_yjkb_em", {}),
+        ])
         result["errors"].extend(quick_errors)
+        if quick_df is None or quick_df.empty:
+            quick_df, quick_source, period_errors = self._earnings_em_by_api(
+                stock_code, ("stock_yjkb_em", "stock_yjbb_em")
+            )
+            result["errors"].extend(period_errors)
         if quick_df is not None:
             row = _extract_latest_row(quick_df, stock_code)
             if row is not None:
