@@ -1950,6 +1950,10 @@ class AkshareFetcher(BaseFetcher):
             import baostock as bs
 
             raw = normalize_stock_code(stock_code)
+            # Baostock 不支持北交所，与 BaostockFetcher 保持一致
+            if is_bse_code(raw):
+                logger.debug(f"[筹码复算] {stock_code} 是北交所，Baostock 不支持")
+                return None
             if raw.startswith(("600", "601", "603", "605", "688")):
                 bs_code = f"sh.{raw}"
             elif raw.startswith(("000", "001", "002", "003", "300", "301")):
@@ -2703,12 +2707,21 @@ def _compute_cyq_metrics(bars: List[Dict[str, Any]]):
     """
     factor = 150          # 价格轴粒度（与东财 CYQ 一致）
     window = 120          # 筹码计算窗口（交易日）
-    if not bars or len(bars) < 2:
+    # 过滤含空字段的 K 线，避免后续 max/min/均价计算崩溃
+    data = [
+        b
+        for b in bars[-window:]
+        if isinstance(b.get("open"), (int, float))
+        and isinstance(b.get("high"), (int, float))
+        and isinstance(b.get("low"), (int, float))
+        and isinstance(b.get("close"), (int, float))
+    ]
+    if len(data) < 2:
         return None
-    data = bars[-window:]
+    data = data[-window:]
 
-    maxprice = max(b["high"] for b in data if b.get("high") is not None)
-    minprice = min(b["low"] for b in data if b.get("low") is not None)
+    maxprice = max(b["high"] for b in data)
+    minprice = min(b["low"] for b in data)
     # 全程同价（一字板）：accuracy 退化为 0.01，与东财 CYQCalculator 行为一致
     accuracy = max(0.01, (maxprice - minprice) / (factor - 1))
 

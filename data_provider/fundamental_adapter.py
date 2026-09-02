@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# 业绩预告/快报/报表接口（stock_yjyg_em/yjbb_em/yjkb_em）按报告期拉取全市场数据，
+# 缓存 (接口, 报告期) -> (拉取时间, DataFrame)，避免批量多股分析重复请求同一期列表。
+_EARNINGS_EM_CACHE: Dict[Tuple[str, str], Tuple[float, Optional[pd.DataFrame]]] = {}
+_EARNINGS_EM_CACHE_TTL_SECONDS = 3600.0
 
 _DIVIDEND_KEYWORD_MAP: Dict[str, List[str]] = {
     "per_share": [
@@ -289,6 +295,78 @@ class AkshareFundamentalAdapter:
                 continue
         return None, None, errors
 
+    @staticmethod
+    def _recent_report_periods(count: int = 2) -> List[str]:
+        """最近 count 个已结束的季度报告期（YYYYMMDD），降序。
+
+        业绩预告/报表通常只在最近 1-2 期还保留全量数据，取 2 期即可；
+        每期是全市场列表，减少尝试次数可显著降低首拉耗时。
+        """
+        now = datetime.now()
+        anchors: List[Tuple[int, int, int]] = []
+        for year in (now.year, now.year - 1):
+            for month, day in ((12, 31), (9, 30), (6, 30), (3, 31)):
+                anchors.append((year, month, day))
+        periods: List[str] = []
+        for year, month, day in sorted(anchors, reverse=True):
+            if datetime(year, month, day) <= now:
+                periods.append(f"{year:04d}{month:02d}{day:02d}")
+            if len(periods) >= count:
+                break
+        return periods
+
+    def _fetch_earnings_em_by_period(
+        self, api_name: str, stock_code: str, errors: List[str]
+    ) -> Optional[pd.DataFrame]:
+        """
+        akshare 业绩预告/快报/报表接口（stock_yjyg_em/yjbb_em/yjkb_em）自某版本起只接受
+        `date`（报告期）参数，按报告期返回全市场列表，不再支持单股 symbol 查询。
+        依次尝试最近几个报告期，命中后按股票代码过滤并以 TTL 缓存全市场结果。
+        """
+        try:
+            import akshare as ak
+        except Exception as exc:
+            errors.append(f"import_akshare:{type(exc).__name__}")
+            return None
+        fn = getattr(ak, api_name, None)
+        if fn is None:
+            errors.append(f"{api_name}:not_found")
+            return None
+
+        target = _normalize_code(stock_code)
+        for period in self._recent_report_periods():
+            cache_key = (api_name, period)
+            hit = _EARNINGS_EM_CACHE.get(cache_key)
+            now = time.time()
+            if hit is not None and now - hit[0] < _EARNINGS_EM_CACHE_TTL_SECONDS:
+                df = hit[1]
+            else:
+                try:
+                    df = fn(date=period)
+                except Exception as exc:
+                    errors.append(f"{api_name}({period}):{type(exc).__name__}")
+                    continue
+                if not isinstance(df, pd.DataFrame):
+                    df = None
+                _EARNINGS_EM_CACHE[cache_key] = (now, df)
+            if df is None or df.empty:
+                continue
+            row = _extract_latest_row(df, stock_code)
+            if row is not None and target:
+                return df
+        return None
+
+    def _earnings_em_by_api(
+        self, stock_code: str, api_names: Tuple[str, ...]
+    ) -> Tuple[Optional[pd.DataFrame], Optional[str], List[str]]:
+        """尝试多个业绩类接口（report 期全市场 + 按代码过滤）。"""
+        errors: List[str] = []
+        for api_name in api_names:
+            df = self._fetch_earnings_em_by_period(api_name, stock_code, errors)
+            if df is not None and not df.empty:
+                return df, f"{api_name}(period)", errors
+        return None, None, errors
+
     def get_fundamental_bundle(self, stock_code: str) -> Dict[str, Any]:
         """
         Return normalized fundamental blocks from AkShare with partial tolerance.
@@ -303,24 +381,35 @@ class AkshareFundamentalAdapter:
         }
 
         # Financial indicators
-        fin_df, fin_source, fin_errors = self._call_df_candidates([
-            ("stock_financial_abstract", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {"symbol": stock_code}),
-            ("stock_financial_analysis_indicator", {}),
-        ])
+        # 优先用业绩报表 stock_yjbb_em(报告期)：列名规整（营业总收入-同比增长/净资产收益率/销售毛利率
+        # 等），按代码过滤即可取到单股最新一期口径；失败再回退 stock_financial_abstract 通用候选。
+        yjbb_df, yjbb_source, yjbb_errors = self._earnings_em_by_api(stock_code, ("stock_yjbb_em",))
+        if yjbb_df is not None and not yjbb_df.empty:
+            fin_df, fin_source, fin_errors = yjbb_df, yjbb_source, []
+        else:
+            fin_errors = yjbb_errors
+            fin_df, fin_source, _ = None, None, []
+            fallback_df, fallback_source, fallback_errors = self._call_df_candidates([
+                ("stock_financial_abstract", {"symbol": stock_code}),
+                ("stock_financial_analysis_indicator", {"symbol": stock_code}),
+                ("stock_financial_analysis_indicator", {}),
+            ])
+            fin_errors.extend(fallback_errors)
+            if fallback_df is not None:
+                fin_df, fin_source = fallback_df, fallback_source
         result["errors"].extend(fin_errors)
         if fin_df is not None:
             row = _extract_latest_row(fin_df, stock_code)
             if row is not None:
-                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业收入同比", "营收同比", "收入同比", "同比增长"]))
-                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润同比", "净利同比", "归母净利润同比"]))
+                revenue_yoy = _safe_float(_pick_by_keywords(row, ["营业总收入-同比增长", "营业收入同比", "营收同比", "收入同比", "同比增长"]))
+                profit_yoy = _safe_float(_pick_by_keywords(row, ["净利润-同比增长", "净利润同比", "净利同比", "归母净利润同比"]))
                 roe = _safe_float(_pick_by_keywords(row, ["净资产收益率", "ROE", "净资产收益"]))
-                gross_margin = _safe_float(_pick_by_keywords(row, ["毛利率"]))
-                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]))
-                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入", "营业收入", "营收"]))
-                net_profit_parent = _safe_float(_pick_by_keywords(row, ["归母净利润", "母公司股东净利润", "净利润"]))
+                gross_margin = _safe_float(_pick_by_keywords(row, ["销售毛利率", "毛利率"]))
+                report_date = _normalize_report_date(_pick_by_keywords(row, _DIVIDEND_KEYWORD_MAP["report_date"]) or _pick_by_keywords(row, ["最新公告日期", "公告日期", "报告期"]))
+                revenue = _safe_float(_pick_by_keywords(row, ["营业总收入-营业总收入", "营业总收入", "营业收入", "营收"]))
+                net_profit_parent = _safe_float(_pick_by_keywords(row, ["净利润-净利润", "归母净利润", "母公司股东净利润", "净利润"]))
                 operating_cash_flow = _safe_float(
-                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "经营现金流", "经营活动现金流"])
+                    _pick_by_keywords(row, ["经营活动产生的现金流量净额", "每股经营现金流量", "经营现金流", "经营活动现金流"])
                 )
                 result["growth"] = {
                     "revenue_yoy": revenue_yoy,
@@ -339,13 +428,10 @@ class AkshareFundamentalAdapter:
                     result["earnings"]["financial_report"] = financial_report_payload
                 result["source_chain"].append(f"growth:{fin_source}")
 
-        # Earnings forecast
-        forecast_df, forecast_source, forecast_errors = self._call_df_candidates([
-            ("stock_yjyg_em", {"symbol": stock_code}),
-            ("stock_yjyg_em", {}),
-            ("stock_yjbb_em", {"symbol": stock_code}),
-            ("stock_yjbb_em", {}),
-        ])
+        # Earnings forecast（akshare 新版业绩预告接口只接受报告期 date，按期拉取后过滤单股）
+        forecast_df, forecast_source, forecast_errors = self._earnings_em_by_api(
+            stock_code, ("stock_yjyg_em", "stock_yjbb_em")
+        )
         result["errors"].extend(forecast_errors)
         if forecast_df is not None:
             row = _extract_latest_row(forecast_df, stock_code)
@@ -356,10 +442,9 @@ class AkshareFundamentalAdapter:
                 result["source_chain"].append(f"earnings_forecast:{forecast_source}")
 
         # Earnings quick report
-        quick_df, quick_source, quick_errors = self._call_df_candidates([
-            ("stock_yjkb_em", {"symbol": stock_code}),
-            ("stock_yjkb_em", {}),
-        ])
+        quick_df, quick_source, quick_errors = self._earnings_em_by_api(
+            stock_code, ("stock_yjkb_em", "stock_yjbb_em")
+        )
         result["errors"].extend(quick_errors)
         if quick_df is not None:
             row = _extract_latest_row(quick_df, stock_code)

@@ -3672,6 +3672,15 @@ class SearchService:
 
         return None
 
+    @staticmethod
+    def _searxng_keeps_unknown_datetime(provider) -> bool:
+        """
+        SearXNG 自建实例的 baidu/sogou/bing 结果普遍缺失 publishedDate，
+        严格时效过滤会把可用新闻全部丢弃导致新闻面为空。仅对 SearXNG 放行
+        无日期结果（仍受引擎 time_range 约束），其余 provider 保持严格时效。
+        """
+        return isinstance(provider, SearXNGSearchProvider)
+
     def _filter_news_response(
         self,
         response: SearchResponse,
@@ -3912,7 +3921,7 @@ class SearchService:
                     search_days=search_days,
                     max_results=provider_max_results,
                     log_scope=f"{topic_text}:{provider.name}:topic_news",
-                    keep_unknown=isinstance(provider, SearXNGSearchProvider),
+                    keep_unknown=self._searxng_keeps_unknown_datetime(provider),
                 )
                 if filtered.success and filtered.results:
                     prioritized, _preferred_count = self._prioritize_news_language(
@@ -4152,16 +4161,12 @@ class SearchService:
                         error_message=exc,
                     )
                     raise
-                # SearXNG 自建实例的 baidu/sogou 等引擎结果普遍不带 publishedDate，
-                # 严格时效过滤会把可用新闻全部丢弃，导致新闻面为空。仅对 SearXNG
-                # 放行"无日期"结果，仍受搜索引擎 time_range 约束；其他 provider 保持严格。
-                is_searxng_provider = isinstance(provider, SearXNGSearchProvider)
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
                     log_scope=f"{stock_code}:{provider.name}:stock_news",
-                    keep_unknown=is_searxng_provider,
+                    keep_unknown=self._searxng_keeps_unknown_datetime(provider),
                 )
                 had_provider_success = had_provider_success or bool(response.success)
 
@@ -4573,14 +4578,12 @@ class SearchService:
                     days=request_days,
                 )
             if dim['strict_freshness']:
-                # SearXNG 的 baidu/sogou/bing 结果普遍无 publishedDate，严格过滤会
-                # 丢弃全部可用新闻，与 search_stock_news 保持一致放行无日期结果。
                 filtered_response = self._filter_news_response(
                     response,
                     search_days=search_days,
                     max_results=provider_max_results,
                     log_scope=f"{stock_code}:{provider.name}:{dim['name']}",
-                    keep_unknown=isinstance(provider, SearXNGSearchProvider),
+                    keep_unknown=self._searxng_keeps_unknown_datetime(provider),
                 )
             elif dim['name'] in self.ANALYTICAL_INTEL_DIMENSIONS:
                 filtered_response = self._filter_news_response(

@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] 新增 `SEARXNG_TIMEOUT_SECONDS` 配置自建 SearXNG 单次搜索超时（默认 10 秒），已接线全部 SearchService 构造入口（含题材搜索子进程重建）与默认 GitHub Actions 工作流
 - [新功能] 筹码分布新增本地估算降级：东方财富 `push2his` 端点不可达（RemoteDisconnected/限流）导致 `ak.stock_cyq_em` 失败时，自动改用 Baostock 日K（含换手率）+ 本地 CYQ 三角分布算法复算获利比例/平均成本/90 与 70 成本区间和集中度，保证筹码数据可用；东财接口恢复后仍优先走原路径，算法与东财 CYQCalculator 一致并附单元回归测试。
 - [改进] LLM 调用未显式配置超时时默认放宽到 300 秒：推理模型在长 prompt 下思考+输出可能超过 LiteLLM provider 默认连接超时，导致空响应或输出截断；现有显式配置（`timeout`/`call_timeout`）仍优先。
+- [修复] 主分析 LLM 默认 `max_tokens` 从 8192 提升到 16384：推理模型（如 deepseek-v4-flash）会把大量 token 预算消耗在"思考"阶段，8192 上限时 content 常在思考完成后即被 `finish_reason=length` 截断且为空（表现为 `LLM returned empty response`，约 75 秒失败）；给足预算后完整输出（实测 9416 字符 `finish=stop`）。显式 `max_output_tokens`/`max_tokens` 配置仍优先。
+- [修复] 适配 akshare 新版业绩接口签名：`stock_yjyg_em`/`stock_yjbb_em`/`stock_yjkb_em` 只接受报告期 `date` 参数（按期返回全市场），此前以 `symbol` 调用恒报 TypeError 导致业绩预告/快报块缺失；现按最近报告期拉取后按代码过滤，优先用业绩报表 `stock_yjbb_em` 供应 growth/financial_report（营收、净利、ROE、毛利率等长期因 `stock_financial_abstract` 透视表格式解析失败而缺失的指标恢复），失败回退原候选链；全市场列表带 1 小时 TTL 缓存，首拉耗时从约 110s 降至约 45s。
+- [新功能] 自建 SearXNG 启动自愈：新增 `scripts/start_searxng.ps1` 幂等拉起 Docker Desktop 与 SearXNG 容器（`restart=unless-stopped`，8888->8080，挂载配置目录），并做 JSON 接口健康检查；`main.py` 与 Web 服务启动早期 best-effort 探测自建实例，不可达且 `SEARXNG_AUTO_REPAIR`（默认 true）开启时后台触发该脚本，不阻塞主流程；`SEARXNG_AUTO_REPAIR=false` 可关闭。
 
 - [修复] 美股日线路由现按各数据源当前优先级排序，单项 `*_PRIORITY` 配置（如 `YFINANCE_PRIORITY=0`）对美股即时生效；指数固定首选与 Longbridge preferred 语义保持不变
 
